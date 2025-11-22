@@ -1,26 +1,22 @@
 import argparse
 import sys
-import urllib.request
 import json
-import gzip
+import urllib.request
+from xml.etree import ElementTree as ET
+from urllib.parse import urljoin
+
 
 class DependencyVisualizer:
     def __init__(self):
-        # ЭТАП 1
         self.params = self.parse_command_line()
         self.validate_params()
+        # Вывод параметров УДАЛЁН — он требуется ТОЛЬКО на Этапе 1
 
-        # ЭТАП 2
-        self.dependencies = self.get_dependencies()  # Этап 2
-        self.print_dependencies()  # Этап 2
-
-    def parse_command_line(self):                    # Парсинг аргументов командной строки
+    def parse_command_line(self):
         parser = argparse.ArgumentParser(
             description='Инструмент визуализации графа зависимостей для менеджера пакетов .NET NuGet',
-            epilog='Пример: python src/cli.py -p Newtonsoft.Json -r https://api.nuget.org/v3/index.json'
+            epilog='Пример: python src/cli.py -p Newtonsoft.Json -r https://api.nuget.org/v3/index.json -v 13.0.3'
         )
-
-        # Все 8 параметров
         parser.add_argument('--package', '-p', required=True, help='Имя анализируемого пакета')
         parser.add_argument('--repository', '-r', required=True, help='URL репозитория или путь к тестовому файлу')
         parser.add_argument('--test-mode', '-t', action='store_true', help='Режим работы с тестовым репозиторием')
@@ -29,118 +25,83 @@ class DependencyVisualizer:
         parser.add_argument('--ascii-tree', '-a', action='store_true', help='Вывод ASCII-дерева')
         parser.add_argument('--max-depth', '-d', type=int, default=10, help='Максимальная глубина анализа')
         parser.add_argument('--filter', '-f', default='', help='Подстрока для фильтрации пакетов')
-
         return vars(parser.parse_args())
 
     def validate_params(self):
-    # Валидация параметров
         errors = []
-
         if not self.params['package'].strip():
             errors.append("Имя пакета не может быть пустым")
-
         if not self.params['repository'].strip():
             errors.append("URL репозитория не может быть пустым")
-
         if self.params['max_depth'] <= 0:
             errors.append("Максимальная глубина должна быть > 0")
-
         if errors:
             print("Ошибки валидации:")
             for error in errors:
                 print(f"  - {error}")
             sys.exit(1)
 
-    def get_dependencies(self):                        # Получение прямых зависимостей пакета - ЭТАП 2
-        package_name = self.params['package']
-        version = self.params['version']
-        repository_url = self.params['repository']
 
-        print(f" Получение зависимостей для {package_name} версии {version}...")
-        print(f" Репозиторий: {repository_url}")
+class NuGetClient:
+    def __init__(self, repository_url: str):
+        self.repository_url = repository_url.rstrip('/')
 
-        try:
-            # Получаем данные о пакете из указанного репозитория
-            package_data = self._fetch_package_data(package_name, repository_url)
+    def _fetch_service_index(self):
+        with urllib.request.urlopen(self.repository_url) as resp:
+            index = json.load(resp)
+        for resource in index.get('resources', []):
+            if resource.get('@type') == 'PackageBaseAddress/3.0.0':
+                return resource['@id']
+        raise RuntimeError("PackageBaseAddress not found in service index")
 
-            # Находим данные для нужной версии
-            version_data = self._find_version_data(package_data, version)
-
-            if not version_data:
-                print(f" Версия {version} не найдена")
-                return []
-
-            # Извлекаем зависимости
-            dependencies = self._extract_dependencies(version_data)
-            return dependencies
-
-        except Exception as e:
-            print(f" Ошибка при получении зависимостей: {e}")
-            return []
-
-    def _fetch_package_data(self, package_name: str, repository_url: str) -> dict: # Получает данные о пакете из указанного репозитория
-        api_url = f"{repository_url}/{package_name.lower()}/index.json"
-
-        print(f" Запрос к: {api_url}")
+    def get_package_dependencies(self, package_name: str, version: str):
+        base_url = self._fetch_service_index()
+        pkg_lower = package_name.lower()
+        ver_lower = version.lower()
+        nuspec_url = urljoin(base_url, f"{pkg_lower}/{ver_lower}/{pkg_lower}.nuspec")
 
         try:
-            with urllib.request.urlopen(api_url) as response:
-                # NuGet API возвращает gzip-сжатые данные
-                compressed_data = response.read()
+            with urllib.request.urlopen(nuspec_url) as resp:
+                nuspec_xml = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ValueError(f"Пакет '{package_name}' версии '{version}' не найден в репозитории.")
+            raise
 
-                # Распаковываем gzip
-                decompressed_data = gzip.decompress(compressed_data)
+        root = ET.fromstring(nuspec_xml)
+        ns = {'nuspec': 'http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd'}
 
-                # Декодируем JSON
-                return json.loads(decompressed_data.decode('utf-8'))
-
-        except Exception as e:
-            print(f" Ошибка при запросе к {api_url}: {e}")
-
-    def _find_version_data(self, package_data: dict, target_version: str) -> dict: # Находит данные для конкретной версии пакета
-        items = package_data.get('items', [])
-
-        for item in items:
-            for package in item.get('items', []):
-                catalog_entry = package.get('catalogEntry', {})
-                package_version = catalog_entry.get('version', '')
-
-                if target_version == 'latest' or package_version == target_version:
-                    return catalog_entry
-
-        return {}
-
-    def _extract_dependencies(self, version_data: dict) -> list:       # Извлекает список зависимостей из данных версии
+        # Ищем ВСЕ зависимости — даже внутри <group>
         dependencies = []
-
-        dependency_groups = version_data.get('dependencyGroups', [])
-
-        for group in dependency_groups:
-            for dependency in group.get('dependencies', []):
-                dep_name = dependency.get('id', '')
-                if dep_name:
-                    dependencies.append(dep_name)
+        for dep_elem in root.findall('.//nuspec:dependency', ns):
+            dep_id = dep_elem.get('id')
+            dep_version = dep_elem.get('version', '')
+            if dep_id:  # только если id задан
+                dependencies.append({'id': dep_id, 'version': dep_version})
 
         return dependencies
-
-    def print_dependencies(self): # Вывод прямых зависимостей
-        if not self.dependencies:
-            print("Зависимости не найдены")
-            return
-
-        print(f"\n=== Прямые зависимости пакета {self.params['package']} ===")
-        for i, dep in enumerate(self.dependencies, 1):
-            print(f"{i}. {dep}")
-        print(f"Всего зависимостей: {len(self.dependencies)}")
-        print("=============================================")
 
 
 def main():
     try:
         visualizer = DependencyVisualizer()
 
+        client = NuGetClient(visualizer.params['repository'])
+        version = visualizer.params['version']
+
+        deps = client.get_package_dependencies(
+            package_name=visualizer.params['package'],
+            version=version
+        )
+
+        if deps:
+            for d in deps:
+                print(f"{d['id']} ({d['version']})")
+        else:
+            print(f"Прямые зависимости для {visualizer.params['package']} версии {version} не найдены.")
+
     except Exception as e:
-        print(f" Ошибка: {e}")
+        print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
 
 
