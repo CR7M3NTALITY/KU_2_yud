@@ -10,7 +10,7 @@ class DependencyVisualizer:
     def __init__(self):
         self.params = self.parse_command_line()
         self.validate_params()
-        # Вывод параметров УДАЛЁН — он требуется ТОЛЬКО на Этапе 1
+
 
     def parse_command_line(self):
         parser = argparse.ArgumentParser(
